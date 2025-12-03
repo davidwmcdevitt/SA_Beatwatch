@@ -16,6 +16,7 @@ from aws_cdk import (
 from constructs import Construct
 from .worker_construct import BeatwatchWorker
 import os
+import json
 
 
 class BeatwatchStack(Stack):
@@ -43,6 +44,22 @@ class BeatwatchStack(Stack):
         )
 
 
+        # Load webhook from config file or environment variable
+        def load_webhook_from_config():
+            """Load webhook URL from config.json file."""
+            try:
+                # Get the project root directory (parent of beatwatch/)
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                project_root = os.path.dirname(current_dir)
+                config_path = os.path.join(project_root, "config.json")
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    return config.get("slack_webhook_url")
+            except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                return None
+
+        slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or load_webhook_from_config()
+
         # === 4. LAMBDA FUNCTION ===
         lambda_fn = _lambda.Function(
             self, "BeatwatchDailySender",
@@ -64,7 +81,7 @@ class BeatwatchStack(Stack):
             environment={
                 "ENTRY_QUEUE_URL": entry_queue.queue_url,
                 "CHANNELS": "TNT,NBATV,MTV2HD",
-                "SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/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",
+                "SLACK_WEBHOOK_URL": slack_webhook_url or "",
             },
         )
 

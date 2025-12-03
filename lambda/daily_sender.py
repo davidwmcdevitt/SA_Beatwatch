@@ -17,8 +17,8 @@ CHANNELS = set([ch.strip().upper() for ch in CHANNELS_STR.split(",")])
 # Queue URL from environment
 entry_queue_url = os.environ.get("ENTRY_QUEUE_URL")
 
-# Slack webhook from environment
-slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
+# Slack webhook from environment variable (set by CDK from config.json)
+slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
 
 
 def send_slack_message(message: str):

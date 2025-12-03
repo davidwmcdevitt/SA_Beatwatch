@@ -22,8 +22,21 @@ transcribe_queue_url = "https://sqs.us-east-1.amazonaws.com/158364657192/beatwat
 # Entry queue URL from environment
 entry_queue_url = os.environ.get("ENTRY_QUEUE_URL")
 
-# Slack webhook from environment
-slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
+# Slack webhook from config file or environment variable
+def load_webhook_from_config():
+    """Load webhook URL from config.json file."""
+    try:
+        # Get the project root directory (parent of scripts/)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        config_path = os.path.join(project_root, "config.json")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+            return config.get("slack_webhook_url")
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or load_webhook_from_config()
 
 LOOKBACK_DAYS = 7
 

@@ -12,6 +12,8 @@ from botocore.exceptions import ClientError
 
 s3 = boto3.client("s3")
 sqs = boto3.client("sqs", region_name="us-east-1")
+ec2 = boto3.client("ec2", region_name="us-east-1")
+autoscaling = boto3.client("autoscaling", region_name="us-east-1")
 
 bucket = "beatwatch"
 hive_prefix = "inventory/sourceaudio-sad-archive/beatwatch-inventory/hive/"
@@ -40,42 +42,63 @@ slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or load_webhook_from_con
 
 LOOKBACK_DAYS = 7
 
-# Get instance ID for termination
-instance_id = None
-# First try environment variable (set by user-data script)
-instance_id = os.environ.get("INSTANCE_ID")
-if instance_id:
-    instance_id = instance_id.strip()
-    print(f"[{datetime.datetime.utcnow().isoformat()}] Successfully retrieved instance ID from environment: {instance_id}")
-else:
-    # Fall back to metadata service (with IMDSv2 support)
-    try:
-        # Get IMDSv2 token first
-        token_response = requests.put(
-            "http://169.254.169.254/latest/api/token",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-            timeout=2
-        )
-        if token_response.status_code == 200:
-            token = token_response.text
-            # Use token to get instance ID
-            instance_id = requests.get(
-                "http://169.254.169.254/latest/meta-data/instance-id",
-                headers={"X-aws-ec2-metadata-token": token},
-                timeout=2
-            ).text.strip()
-            print(f"[{datetime.datetime.utcnow().isoformat()}] Successfully retrieved instance ID from metadata: {instance_id}")
-        else:
-            print(f"[{datetime.datetime.utcnow().isoformat()}] WARNING: Failed to get IMDSv2 token: {token_response.status_code}")
-    except Exception as e:
-        print(f"[{datetime.datetime.utcnow().isoformat()}] WARNING: Failed to retrieve instance ID: {e}")
-        pass
+# Get instance metadata
+instance_id = os.environ.get("INSTANCE_ID", "").strip()
+asg_name = os.environ.get("ASG_NAME", "").strip()
 
 
 def log(message: str, level: str = "INFO"):
     """Helper function for consistent timestamped logging."""
     timestamp = datetime.datetime.utcnow().isoformat()
     print(f"[{timestamp}] [{level}] {message}")
+
+
+def terminate_instance(exit_code: int):
+    """
+    Terminate this instance following crash-and-terminate pattern.
+    Called via atexit, ensures instance cleanup regardless of exit reason.
+    """
+    log(f"Worker script exited with code {exit_code}")
+    
+    if not instance_id or instance_id == "unknown":
+        log("Instance ID not available, skipping termination", "WARNING")
+        return
+    
+    # Determine lifecycle action result
+    if exit_code == 0:
+        log("Success - completing lifecycle hook and terminating")
+        lifecycle_result = "CONTINUE"
+    else:
+        log(f"Error exit code {exit_code} - completing lifecycle hook and terminating")
+        lifecycle_result = "ABANDON"
+    
+    # Complete lifecycle hook if exists
+    if asg_name:
+        try:
+            log(f"Completing lifecycle hook for ASG: {asg_name}")
+            autoscaling.complete_lifecycle_action(
+                LifecycleActionResult=lifecycle_result,
+                LifecycleHookName="BeatwatchWorkerTerminationHook",
+                AutoScalingGroupName=asg_name,
+                InstanceId=instance_id
+            )
+            log("Lifecycle hook completed successfully")
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code == "ValidationError":
+                log("No lifecycle hook to complete (not in terminating state)", "INFO")
+            else:
+                log(f"Failed to complete lifecycle hook: {e}", "WARNING")
+        except Exception as e:
+            log(f"Failed to complete lifecycle hook: {e}", "WARNING")
+    
+    # Always terminate instance
+    try:
+        log(f"Terminating instance: {instance_id}")
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        log("Instance termination initiated successfully")
+    except Exception as e:
+        log(f"Failed to terminate instance: {e}", "ERROR")
 
 
 def send_job_to_sqs(queue_url, input_s3_uri, output_s3_uri=None):
@@ -262,31 +285,44 @@ def main():
     log(f"Transcribe queue URL: {transcribe_queue_url}")
     log(f"Bucket: {bucket}")
     log(f"Lookback days: {LOOKBACK_DAYS}")
-    log(f"Instance ID: {instance_id or 'UNKNOWN (not running on EC2)'}")
+    log(f"Instance ID: {instance_id or 'unknown'}")
+    log(f"ASG Name: {asg_name or 'unknown'}")
     log(f"BeatwatchWorker started at {datetime.datetime.utcnow().isoformat()}")
 
     channels_processed = []
     total_sent = 0
     total_skipped = 0
     poll_count = 0
-
-    log("Starting queue polling loop...")
+    empty_polls = 0
+    max_empty_polls = 5  # Exit after 5 empty polls (~75 seconds with WaitTimeSeconds=15)
+    log(f"Starting queue polling loop (max {max_empty_polls} empty polls before exit)...")
+    
     while True:
         try:
             poll_count += 1
-            log(f"Poll attempt #{poll_count}: Receiving message from queue (long polling, 20s wait)...")
+            log(f"Poll attempt #{poll_count}: Receiving message from queue (long polling, 15s wait)...")
             
             # Receive message from entry queue
             response = sqs.receive_message(
                 QueueUrl=entry_queue_url,
                 MaxNumberOfMessages=1,
-                WaitTimeSeconds=20,  # Long polling
+                WaitTimeSeconds=15,  # Long polling
                 VisibilityTimeout=3600,  # 1 hour visibility timeout
             )
 
             if "Messages" not in response or len(response["Messages"]) == 0:
-                log("Queue is empty (no messages received). Exiting worker.")
-                break
+                empty_polls += 1
+                log(f"No messages (empty poll {empty_polls}/{max_empty_polls})")
+                
+                if empty_polls >= max_empty_polls:
+                    log(f"Reached {max_empty_polls} empty polls, exiting gracefully")
+                    break
+                
+                time.sleep(3)
+                continue
+
+            # Reset empty poll counter when we get a message
+            empty_polls = 0
 
             message = response["Messages"][0]
             receipt_handle = message["ReceiptHandle"]
@@ -344,13 +380,13 @@ def main():
             log("Waiting 10 seconds before retrying...")
             time.sleep(10)
 
-    # Send summary and exit (Auto Scaling will handle instance termination when queue is empty)
+    # Send summary and exit
     log("=" * 80)
     log("BeatwatchWorker finishing - generating summary")
     log("=" * 80)
     
     msg = (
-        f"*BeatwatchWorker Stage 1 Summary*\n"
+        f"*BeatwatchWorker Summary*\n"
         f"Instance: {instance_id or 'unknown'}\n"
         f"Channels processed: {len(channels_processed)} ({', '.join(channels_processed) if channels_processed else 'none'})\n"
         f"Total files sent to transcribe queue: {total_sent}\n"
@@ -359,6 +395,7 @@ def main():
     
     log("Final summary:")
     log(f"  Instance ID: {instance_id or 'unknown'}")
+    log(f"  ASG Name: {asg_name or 'unknown'}")
     log(f"  Channels processed: {len(channels_processed)}")
     log(f"  Channels list: {', '.join(channels_processed) if channels_processed else '(none)'}")
     log(f"  Total files sent to transcribe queue: {total_sent}")
@@ -368,13 +405,28 @@ def main():
     send_slack_message(msg)
     log("Summary sent to Slack")
     print("\n" + msg)
-
-    # Exit with code 0 for success - Auto Scaling will scale down and terminate the instance
     log("Exiting with code 0 (success)")
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    import os
-    main()
+    import atexit
+    
+    # Track exit code for termination handler (use list for closure access)
+    _exit_code = [0]
+    
+    # Register termination handler
+    def exit_handler():
+        terminate_instance(_exit_code[0])
+    
+    atexit.register(exit_handler)
+    
+    try:
+        main()
+    except Exception as e:
+        _exit_code[0] = 1
+        log(f"Uncaught exception in main: {e}", "ERROR")
+        import traceback
+        log(f"Traceback: {traceback.format_exc()}", "ERROR")
+        sys.exit(1)
 

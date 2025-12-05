@@ -9,6 +9,7 @@ from aws_cdk import (
 )
 from constructs import Construct
 import os
+import json
 
 
 class BeatwatchWorker(Construct):
@@ -99,10 +100,23 @@ class BeatwatchWorker(Construct):
         )
         requirements_asset.grant_read(worker_role)
 
+        # Load Pushover credentials from config.json
+        config_path = os.path.join(os.path.dirname(__file__), "..", "config.json")
+        pushover_app_token = None
+        pushover_user_key = None
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                pushover_app_token = config.get("pushover_app_token")
+                pushover_user_key = config.get("pushover_user_key")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Could not load Pushover credentials from config.json: {e}")
+
         # User data script with proper logging and error handling
         user_data = ec2.UserData.for_linux()
 
-        user_data.add_commands(
+        # Build user data commands
+        user_data_commands = [
             "#!/bin/bash",
             "set -euxo pipefail",
             # Logging setup
@@ -122,6 +136,16 @@ class BeatwatchWorker(Construct):
             # Worker environment
             f"export ENTRY_QUEUE_URL={queue.queue_url}",
             "export AWS_DEFAULT_REGION=us-east-1",
+        ]
+        
+        # Add Pushover credentials if configured
+        if pushover_app_token:
+            user_data_commands.append(f"export PUSHOVER_APP_TOKEN={pushover_app_token}")
+        if pushover_user_key:
+            user_data_commands.append(f"export PUSHOVER_USER_KEY={pushover_user_key}")
+        
+        # Add remaining commands
+        user_data_commands.extend([
             # Instance metadata for logging
             "export INSTANCE_ID=$(ec2-metadata --instance-id | cut -d ' ' -f 2)",
             "export INSTANCE_TYPE=$(ec2-metadata --instance-type | cut -d ' ' -f 2)",
@@ -133,7 +157,9 @@ class BeatwatchWorker(Construct):
             "chmod +x worker.py",
             # Run worker (termination handled within Python script via atexit)
             "python3.11 worker.py",
-        )
+        ])
+        
+        user_data.add_commands(*user_data_commands)
 
         # Launch template
         launch_template = ec2.LaunchTemplate(

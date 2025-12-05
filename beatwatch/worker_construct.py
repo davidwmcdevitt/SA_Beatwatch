@@ -35,13 +35,24 @@ class BeatwatchWorker(Construct):
             ],
         )
 
-        # Allow reading from S3 inventory bucket
+        # Allow reading and writing to beatwatch bucket
         worker_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["s3:GetObject", "s3:ListBucket"],
+                actions=["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:HeadObject"],
                 resources=[
                     "arn:aws:s3:::beatwatch",
                     "arn:aws:s3:::beatwatch/*",
+                ],
+            )
+        )
+
+        # Allow reading, writing, and deleting from batch processor bucket
+        worker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:HeadObject", "s3:DeleteObject"],
+                resources=[
+                    "arn:aws:s3:::sourceaudio-gpt-batch-processor",
+                    "arn:aws:s3:::sourceaudio-gpt-batch-processor/*",
                 ],
             )
         )
@@ -57,16 +68,16 @@ class BeatwatchWorker(Construct):
             )
         )
 
-        # Allow lifecycle hook operations (for potential future handler scripts)
+        # Allow lifecycle hook operations and instance termination
         worker_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
-                    "ec2:DescribeInstances",
-                    "ec2:CreateTags",
                     "autoscaling:CompleteLifecycleAction",
                     "autoscaling:RecordLifecycleActionHeartbeat",
                     "autoscaling:DescribeAutoScalingInstances",
                     "autoscaling:DescribeLifecycleHooks",
+                    "ec2:TerminateInstances",
+                    "ec2:DescribeInstances",
                 ],
                 resources=["*"],
             )
@@ -105,23 +116,22 @@ class BeatwatchWorker(Construct):
             # Pull script and requirements from S3
             f"aws s3 cp s3://{script_asset.s3_bucket_name}/{script_asset.s3_object_key} ./worker.py",
             f"aws s3 cp s3://{requirements_asset.s3_bucket_name}/{requirements_asset.s3_object_key} ./requirements.txt",
+            # Install Python dependencies
+            "python3.11 -m pip install --upgrade pip",
+            "python3.11 -m pip install -r requirements.txt",
             # Worker environment
             f"export ENTRY_QUEUE_URL={queue.queue_url}",
             "export AWS_DEFAULT_REGION=us-east-1",
             # Instance metadata for logging
             "export INSTANCE_ID=$(ec2-metadata --instance-id | cut -d ' ' -f 2)",
             "export INSTANCE_TYPE=$(ec2-metadata --instance-type | cut -d ' ' -f 2)",
-            # Exit handler - log exit code for debugging (Auto Scaling will handle termination)
-            "exit_handler() {",
-            "    EXIT_CODE=$?",
-            "    echo \"Worker script exited with code $EXIT_CODE\"",
-            "}",
-            "trap exit_handler EXIT",
-            # Install Python dependencies (after trap is set up)
-            "python3.11 -m pip install --upgrade pip",
-            "python3.11 -m pip install -r requirements.txt",
+            # ASG metadata for lifecycle hooks
+            "ASG_NAME=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTANCE_ID "
+            "--query 'AutoScalingInstances[0].AutoScalingGroupName' --output text)",
+            "export ASG_NAME",
+            # Make script executable
             "chmod +x worker.py",
-            # Run worker
+            # Run worker (termination handled within Python script via atexit)
             "python3.11 worker.py",
         )
 
@@ -160,19 +170,20 @@ class BeatwatchWorker(Construct):
         self.asg.add_lifecycle_hook(
             "BeatwatchWorkerTerminationHook",
             lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_TERMINATING,
-            default_result=autoscaling.DefaultResult.CONTINUE,
+            default_result=autoscaling.DefaultResult.ABANDON,
             heartbeat_timeout=Duration.seconds(300),
         )
 
-        # Scale based on queue depth
+        # Scale based on queue depth - matches vocal annotation scaling intervals
         self.asg.scale_on_metric(
             "ScaleOnQueueDepth",
             metric=queue.metric_approximate_number_of_messages_visible(),
             scaling_steps=[
-                autoscaling.ScalingInterval(lower=0, upper=10, change=1),   # 0-10  -> 1 instance
-                autoscaling.ScalingInterval(lower=10, upper=30, change=2),  # 10-30 -> 2 instances (overlaps at 10)
-                autoscaling.ScalingInterval(lower=30, upper=50, change=3),  # 30-50 -> 3 instances (overlaps at 30)
-                autoscaling.ScalingInterval(lower=50, change=5),            # 50+   -> 5 instances (overlaps at 50)
+                autoscaling.ScalingInterval(upper=1, change=0),           # 0 msgs    -> 0
+                autoscaling.ScalingInterval(lower=1, upper=11, change=1),   # 1-10    -> 1
+                autoscaling.ScalingInterval(lower=11, upper=31, change=2),  # 11-30   -> 2
+                autoscaling.ScalingInterval(lower=31, upper=51, change=3),  # 31-50   -> 3
+                autoscaling.ScalingInterval(lower=51, change=5),            # 51+     -> 5
             ],
             adjustment_type=autoscaling.AdjustmentType.EXACT_CAPACITY,
         )

@@ -36,17 +36,16 @@ class BeatwatchStack(Stack):
         entry_queue = sqs.Queue(
             self, "BeatwatchEntryQueue",
             queue_name="BeatwatchEntry",
-            visibility_timeout=Duration.seconds(3600),  # 1 hour
+            visibility_timeout=Duration.seconds(3600),  # 1 hour for long-running worker tasks
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=3,
                 queue=entry_dlq,
             ),
         )
 
-
-        # Load webhook from config file or environment variable
-        def load_webhook_from_config():
-            """Load webhook URL from config.json file."""
+        # Load Pushover credentials from config file or environment variables
+        def load_pushover_from_config():
+            """Load Pushover credentials from config.json file."""
             try:
                 # Get the project root directory (parent of beatwatch/)
                 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,13 +53,15 @@ class BeatwatchStack(Stack):
                 config_path = os.path.join(project_root, "config.json")
                 with open(config_path, "r") as f:
                     config = json.load(f)
-                    return config.get("slack_webhook_url")
+                    return config.get("pushover_app_token"), config.get("pushover_user_key")
             except (FileNotFoundError, json.JSONDecodeError, KeyError):
-                return None
+                return None, None
 
-        slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or load_webhook_from_config()
+        config_token, config_user_key = load_pushover_from_config()
+        pushover_app_token = os.environ.get("PUSHOVER_APP_TOKEN") or config_token
+        pushover_user_key = os.environ.get("PUSHOVER_USER_KEY") or config_user_key
 
-        # === 4. LAMBDA FUNCTION ===
+        # === 3. LAMBDA FUNCTION ===
         lambda_fn = _lambda.Function(
             self, "BeatwatchDailySender",
             function_name="BeatwatchDailySender",
@@ -81,15 +82,16 @@ class BeatwatchStack(Stack):
             environment={
                 "ENTRY_QUEUE_URL": entry_queue.queue_url,
                 "CHANNELS": "TNT,NBATV,MTV2HD",
-                "SLACK_WEBHOOK_URL": slack_webhook_url or "",
+                "PUSHOVER_APP_TOKEN": pushover_app_token or "",
+                "PUSHOVER_USER_KEY": pushover_user_key or "",
             },
         )
 
         # Lambda IAM permissions
-        # Allow reading from S3 inventory bucket
+        # Allow reading from S3 inventory bucket and writing failed Pushover messages
         lambda_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["s3:GetObject", "s3:ListBucket"],
+                actions=["s3:GetObject", "s3:ListBucket", "s3:PutObject"],
                 resources=[
                     "arn:aws:s3:::beatwatch",
                     "arn:aws:s3:::beatwatch/*",
@@ -100,7 +102,7 @@ class BeatwatchStack(Stack):
         # Grant send message permission to entry queue
         entry_queue.grant_send_messages(lambda_fn)
 
-        # === 5. EVENTBRIDGE SCHEDULE (7am Chicago time) ===
+        # === 4. EVENTBRIDGE SCHEDULE (7am Chicago time) ===
         # Chicago is UTC-6 (CST) or UTC-5 (CDT)
         # 7am CST = 13:00 UTC, 7am CDT = 12:00 UTC
         # Using 13:00 UTC as default (CST)
@@ -116,7 +118,7 @@ class BeatwatchStack(Stack):
             targets=[targets.LambdaFunction(lambda_fn)],
         )
 
-        # === 6. WORKER CONSTRUCT ===
+        # === 5. WORKER CONSTRUCT ===
         # ARN for existing beatwatch-transcribe queue
         transcribe_queue_arn = f"arn:aws:sqs:us-east-1:158364657192:beatwatch-transcribe"
 
@@ -127,7 +129,16 @@ class BeatwatchStack(Stack):
             transcribe_queue_arn=transcribe_queue_arn,
         )
 
-        # === 7. CLOUDWATCH ALARMS ===
+        # === 6. CLOUDWATCH ALARMS ===
+        # Lambda function errors alarm
+        lambda_errors_alarm = cloudwatch.Alarm(
+            self, "LambdaErrorsAlarm",
+            metric=lambda_fn.metric_errors(),
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="Alert when Lambda function has errors",
+        )
+
         # Entry queue DLQ message count alarm
         entry_dlq_alarm = cloudwatch.Alarm(
             self, "EntryDLQAlarm",
@@ -146,19 +157,10 @@ class BeatwatchStack(Stack):
             alarm_description="Alert when messages in entry queue are older than 1 hour",
         )
 
-        # Lambda function errors alarm
-        lambda_errors_alarm = cloudwatch.Alarm(
-            self, "LambdaErrorsAlarm",
-            metric=lambda_fn.metric_errors(),
-            threshold=1,
-            evaluation_periods=1,
-            alarm_description="Alert when Lambda function has errors",
-        )
-
-        # === 8. STACK TAGS ===
+        # === 7. STACK TAGS ===
         Tags.of(self).add("Project", "Beatwatch")
 
-        # === 9. OUTPUTS ===
+        # === 8. OUTPUTS ===
         CfnOutput(self, "EntryQueueUrl", value=entry_queue.queue_url)
         CfnOutput(self, "EntryQueueArn", value=entry_queue.queue_arn)
         CfnOutput(self, "LambdaFunctionName", value=lambda_fn.function_name)

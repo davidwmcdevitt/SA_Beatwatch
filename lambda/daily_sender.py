@@ -2,6 +2,7 @@ import boto3
 import json
 import os
 import requests
+import datetime
 from botocore.exceptions import ClientError
 
 s3 = boto3.client("s3")
@@ -17,29 +18,89 @@ CHANNELS = set([ch.strip().upper() for ch in CHANNELS_STR.split(",")])
 # Queue URL from environment
 entry_queue_url = os.environ.get("ENTRY_QUEUE_URL")
 
-# Slack webhook from environment variable (set by CDK from config.json)
-slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+# Pushover credentials from environment variables (set by CDK from config.json)
+pushover_app_token = os.environ.get("PUSHOVER_APP_TOKEN")
+pushover_user_key = os.environ.get("PUSHOVER_USER_KEY")
 
 
-def send_slack_message(message: str):
-    """Send message to Slack."""
-    if not slack_webhook_url:
-        print("Slack webhook not configured.")
+def save_failed_pushover_message_to_s3(message: str, error_info: dict):
+    """Save failed Pushover message to S3 for later review."""
+    try:
+        timestamp = datetime.datetime.utcnow().isoformat().replace(":", "-")
+        key = f"failed-pushover-messages/{timestamp}.json"
+        
+        data = {
+            "original_message": message,
+            "error_info": error_info,
+            "timestamp": timestamp,
+            "source": "BeatwatchSend"
+        }
+        
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(data, indent=2),
+            ContentType="application/json"
+        )
+        print(f"Saved failed Pushover message to s3://{bucket}/{key}")
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to save message to S3: {e}")
+        return False
+
+
+def send_pushover_message(message: str):
+    """Send message to Pushover."""
+    if not pushover_app_token or not pushover_user_key:
+        print("Pushover credentials not configured.")
         return
 
-    payload = {
-        "text": message,
-        "channel": "#observation-deck",
-        "username": "BeatwatchSend",
-        "icon_emoji": ":robot_face:"
-    }
-
     try:
-        response = requests.post(slack_webhook_url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"Slack error: Status {response.status_code}, Response: {response.text}")
-    except Exception as e:
-        print(f"Failed to send Slack message: {e}")
+        print(f"Sending Pushover message: {message[:100]}...")
+        response = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": pushover_app_token,
+                "user": pushover_user_key,
+                "message": message
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        if data.get("status") != 1:
+            # Enhanced structured logging with message content
+            error_info = {
+                "status_code": response.status_code,
+                "response_data": data,
+                "message_preview": message[:500],  # First 500 chars
+                "message_length": len(message),
+                "timestamp": datetime.datetime.utcnow().isoformat()
+            }
+            error_data = {
+                "event": "pushover_api_failure",
+                **error_info
+            }
+            print(f"ERROR: Pushover error: {json.dumps(error_data)}")
+            # Save to S3 for recovery
+            save_failed_pushover_message_to_s3(message, error_info)
+    except requests.RequestException as e:
+        # Enhanced structured logging with message content
+        error_info = {
+            "exception_type": type(e).__name__,
+            "exception_message": str(e),
+            "message_preview": message[:500],
+            "message_length": len(message),
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        }
+        error_data = {
+            "event": "pushover_api_exception",
+            **error_info
+        }
+        print(f"ERROR: Failed to send Pushover message: {json.dumps(error_data)}")
+        # Save to S3 for recovery
+        save_failed_pushover_message_to_s3(message, error_info)
 
 
 def find_latest_hive_folder():
@@ -82,7 +143,7 @@ def lambda_handler(event, context=None):
     if not entry_queue_url:
         error_msg = "ENTRY_QUEUE_URL environment variable not set"
         print(f"ERROR: {error_msg}")
-        send_slack_message(f"BeatwatchSend failed: {error_msg}")
+        send_pushover_message(f"BeatwatchSend failed: {error_msg}")
         return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
     try:
@@ -106,7 +167,7 @@ def lambda_handler(event, context=None):
             f"Latest Hive folder: {latest}"
         )
 
-        send_slack_message(msg)
+        send_pushover_message(msg)
         print(msg)
 
         return {"statusCode": 200, "body": json.dumps({"message": msg, "sent": sent, "failed": failed})}
@@ -114,6 +175,6 @@ def lambda_handler(event, context=None):
     except Exception as e:
         err = f"BeatwatchSend failed: {e}"
         print(err)
-        send_slack_message(err)
+        send_pushover_message(err)
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
